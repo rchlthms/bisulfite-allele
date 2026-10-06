@@ -1,0 +1,386 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+PIPELINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+source "$PIPELINE_DIR/scripts/pipeline_utils.sh"
+
+if [[ $# -ne 1 ]]; then
+    echo "Usage: $0 <config_file>"
+    echo "Example: $0 config/config.sh"
+    exit 1
+fi
+
+CONFIG_FILE="$1"
+
+log "Using configuration file: $CONFIG_FILE"
+
+check_file_exists "$CONFIG_FILE"
+
+source "$CONFIG_FILE"
+
+log "Checking reference genome"
+check_file_exists "$reference_genome"
+
+if [[ ! -f "${reference_genome}.fai" ]]; then
+    log "Reference genome index not found. Creating it."
+    samtools faidx "$reference_genome"
+fi
+
+log "Pipeline directory: $PIPELINE_DIR"
+log "Region: $region_name"
+log "SNP position: $SNP_position"
+log "Reference allele: $reference_allele"
+log "Alternate allele: $alternate_allele"
+
+samtools faidx "$reference_genome" "$region_locus" > "$region_name.fasta"
+
+relative_SNP_position=$((SNP_position - first_position + 1))
+
+# Extract the base at the SNP position
+actual_allele=$(awk -v pos="$relative_SNP_position" '
+    NR > 1 {seq = seq $0}
+    END {print substr(seq, pos, 1)}
+' "$region_name.fasta")
+
+log "Base at SNP position $SNP_position is $actual_allele"
+
+if [[ "$actual_allele" == "$reference_allele" ]]; then
+    log "Reference allele $reference_allele matches at position $relative_SNP_position"
+
+    mv "$region_name.fasta" "${region_name}_${reference_allele}.fasta"
+    check_file_exists "${region_name}_${reference_allele}.fasta"
+    log "Using original FASTA as reference allele: ${region_name}_${reference_allele}.fasta"
+
+    awk -v pos="$relative_SNP_position" -v alt="$alternate_allele" '
+        NR == 1 {print $0}
+        NR > 1 {seq = seq $0}
+        END {
+            seq = substr(seq, 1, pos - 1) alt substr(seq, pos + 1)
+            for (i = 1; i <= length(seq); i += 60)
+                print substr(seq, i, 60)
+        }
+    ' "${region_name}_${reference_allele}.fasta" \
+        > "${region_name}_${alternate_allele}.fasta"
+
+    check_file_exists "${region_name}_${alternate_allele}.fasta"
+
+    log "Created new FASTA file with alternate allele: ${region_name}_${alternate_allele}.fasta"
+
+elif [[ "$actual_allele" == "$alternate_allele" ]]; then
+    log "Alternate allele $alternate_allele matches at position $relative_SNP_position"
+
+    mv "$region_name.fasta" "${region_name}_${alternate_allele}.fasta"
+    check_file_exists "${region_name}_${alternate_allele}.fasta"
+
+    awk -v pos="$relative_SNP_position" -v ref="$reference_allele" '
+        NR == 1 {print $0}
+        NR > 1 {seq = seq $0}
+        END {
+            seq = substr(seq, 1, pos - 1) ref substr(seq, pos + 1)
+            for (i = 1; i <= length(seq); i += 60)
+                print substr(seq, i, 60)
+        }
+    ' "${region_name}_${alternate_allele}.fasta" \
+        > "${region_name}_${reference_allele}.fasta"
+
+    check_file_exists "${region_name}_${reference_allele}.fasta"
+
+    log "Created new FASTA file with reference allele: ${region_name}_${reference_allele}.fasta"
+
+else
+    log_error "$region_name.fasta did not match SNP at position $relative_SNP_position."
+fi
+
+reference_genome_dir="$output_dir/${region_name}/${region_name}_${reference_allele}_genome"
+alternate_genome_dir="$output_dir/${region_name}/${region_name}_${alternate_allele}_genome"
+
+mkdir -p "$reference_genome_dir"
+mkdir -p "$alternate_genome_dir"
+
+mv "${region_name}_${reference_allele}.fasta" "$reference_genome_dir/"
+mv "${region_name}_${alternate_allele}.fasta" "$alternate_genome_dir/"
+
+check_file_exists "$reference_genome_dir/${region_name}_${reference_allele}.fasta"
+check_file_exists "$alternate_genome_dir/${region_name}_${alternate_allele}.fasta"
+
+log "Reference genome directory: $reference_genome_dir"
+log "Alternate genome directory: $alternate_genome_dir"
+
+log "Building Bisulfite Genomes"
+
+# Prepare reference-allele genome for Bismark
+bismark_genome_preparation --verbose "$reference_genome_dir" \
+    > "${reference_genome_dir}/bismark_genome_preparation.log" 2>&1
+
+if [[ -d "$reference_genome_dir/Bisulfite_Genome" ]]; then
+    log "Reference genome prepared: $reference_genome_dir"
+else
+    log_error "Reference genome preparation failed!"
+fi
+
+# Prepare alternate-allele genome for Bismark
+bismark_genome_preparation --verbose "$alternate_genome_dir" \
+    > "${alternate_genome_dir}/bismark_genome_preparation.log" 2>&1
+
+if [[ -d "$alternate_genome_dir/Bisulfite_Genome" ]]; then
+    log "Alternate genome prepared: $alternate_genome_dir"
+else
+    log_error "Alternate genome preparation failed!"
+fi
+
+log "Checking input FASTQ files"
+
+check_dir_exists "$input_dir"
+
+for sample in "${samples[@]}"; do
+    fastq_file="$input_dir/${sample}.fastq"
+
+    if [[ -f "$fastq_file" ]]; then
+        log "Found FASTQ: $fastq_file"
+    else
+        log_error "FASTQ file not found: $fastq_file"
+    fi
+done
+
+log "Preparing trimming and QC"
+
+trimmed_dir="$output_dir/trimmed"
+mkdir -p "$trimmed_dir"
+
+log "Trimmed FASTQ output directory: $trimmed_dir"
+
+for sample in "${samples[@]}"; do
+    fastq_file="$input_dir/${sample}.fastq"
+    trim_log="$trimmed_dir/${sample}_trim_galore.log"
+
+    log "Trimming $fastq_file"
+    log "Trim Galore log: $trim_log"
+
+    trim_galore \
+        --fastqc \
+        --length 50 \
+        --output_dir "$trimmed_dir" \
+        "$fastq_file" \
+        > "$trim_log" 2>&1
+done
+
+log "Trimming completed for all FASTQ files"
+
+log "Preparing Bismark alignment"
+
+bismark_dir="$output_dir/bismark"
+mkdir -p "$bismark_dir"
+
+log "Bismark output directory: $bismark_dir"
+
+for sample in "${samples[@]}"; do
+    fastq="$trimmed_dir/${sample}_trimmed.fq"
+
+    check_file_exists "$fastq"
+
+    log "Preparing alignment for sample: $sample"
+
+    ref_dir="$bismark_dir/${sample}/${reference_allele}"
+    alt_dir="$bismark_dir/${sample}/${alternate_allele}"
+
+    mkdir -p "$ref_dir"
+    mkdir -p "$alt_dir"
+
+    log "Reference output directory: $ref_dir"
+    log "Alternate output directory: $alt_dir"
+    
+    ref_log="$ref_dir/bismark_alignment.log"
+    alt_log="$alt_dir/bismark_alignment.log"
+
+    log "Aligning $sample to reference allele ($reference_allele)"
+    
+    bismark \
+        --genome "$reference_genome_dir" \
+        -o "$ref_dir" \
+        --bowtie2 \
+        "$fastq" \
+        > "$ref_log" 2>&1
+
+    log "Reference alignment completed for $sample"
+
+    log "Aligning $sample to alternate allele ($alternate_allele)"
+
+    bismark \
+        --genome "$alternate_genome_dir" \
+        -o "$alt_dir" \
+        --bowtie2 \
+        "$fastq" \
+        > "$alt_log" 2>&1
+
+    log "Alternate alignment completed for $sample"
+done
+
+log "Aligned all trimmed FASTQ files"
+
+log "Splitting BAMs by allele"
+
+export relative_SNP_position
+export reference_allele
+export alternate_allele
+
+for sample in "${samples[@]}"; do
+
+    ref_dir="$bismark_dir/${sample}/${reference_allele}"
+    alt_dir="$bismark_dir/${sample}/${alternate_allele}"
+
+    check_dir_exists "$ref_dir"
+    check_dir_exists "$alt_dir"
+
+    log "Processing reference BAM for $sample"
+
+    python "$PIPELINE_DIR/scripts/process_bam.py" "$ref_dir"
+
+    log "Processing alternate BAM for $sample"
+
+    python "$PIPELINE_DIR/scripts/process_bam.py" "$alt_dir"
+
+done
+
+log "Finished splitting BAMs by allele"
+
+log "Identifying reads shared between genome alignments"
+
+merged_dir="$output_dir/merged"
+mkdir -p "$merged_dir"
+
+for sample in "${samples[@]}"; do
+
+    reference_dir="$bismark_dir/${sample}/${reference_allele}"
+    alternate_dir="$bismark_dir/${sample}/${alternate_allele}"
+
+    check_dir_exists "$reference_dir"
+    check_dir_exists "$alternate_dir"
+
+    log "Processing shared reads for $sample"
+
+    for allele in "$reference_allele" "$alternate_allele"; do
+
+        reference_bam="$reference_dir/${allele}_allele_reads.bam"
+        alternate_bam="$alternate_dir/${allele}_allele_reads.bam"
+
+        check_file_exists "$reference_bam"
+        check_file_exists "$alternate_bam"
+
+        reference_read_names="$merged_dir/${sample}_${allele}_reference_read_names.txt"
+
+        log "Getting read names from reference BAM for $sample, allele $allele"
+
+        samtools view "$reference_bam" |
+            cut -f1 |
+            sort -u > "$reference_read_names"
+
+        log "Saved reference read names: $reference_read_names"
+        
+        alternate_filtered_bam="$merged_dir/${sample}_${allele}_alternate_filtered.bam"
+
+        log "Removing shared reads from alternate BAM for $sample, allele $allele"
+
+        samtools view -h "$alternate_bam" |
+            awk -v read_names="$reference_read_names" '
+                BEGIN {
+                    while ((getline < read_names) > 0)
+                        seen[$1] = 1
+                }
+                /^@/ || !($1 in seen)
+            ' |
+            samtools view -b -o "$alternate_filtered_bam" -
+
+        check_file_exists "$alternate_filtered_bam"
+
+        log "Created filtered alternate BAM: $alternate_filtered_bam"
+        
+        merged_bam="$merged_dir/${sample}_${allele}_merged.bam"
+
+        log "Merging BAM files for $sample, allele $allele"
+
+        samtools merge -f "$merged_bam" \
+            "$reference_bam" \
+            "$alternate_filtered_bam"
+
+        check_file_exists "$merged_bam"
+
+        log "Created merged BAM: $merged_bam"
+        
+        sorted_bam="$merged_dir/${sample}_${allele}_sorted.bam"
+
+        log "Sorting merged BAM for $sample, allele $allele"
+
+        samtools sort \
+            -o "$sorted_bam" \
+            "$merged_bam"
+
+        check_file_exists "$sorted_bam"
+
+        log "Created sorted BAM: $sorted_bam"
+        
+        unique_bam="$merged_dir/${sample}_${allele}_uniqued.bam"
+
+        log "Creating final BAM for $sample, allele $allele"
+
+        mv "$sorted_bam" "$unique_bam"
+
+        check_file_exists "$unique_bam"
+
+        log "Created final BAM: $unique_bam"
+
+    done
+
+done
+
+log "Running Bismark methylation extractor"
+
+methylation_dir="$output_dir/methylation_extractor"
+
+mkdir -p "$methylation_dir"
+mkdir -p "$results_dir"
+
+for sample in "${samples[@]}"; do
+
+    for allele in "$reference_allele" "$alternate_allele"; do
+
+        bam="$merged_dir/${sample}_${allele}_uniqued.bam"
+
+        check_file_exists "$bam"
+
+        if [[ "$allele" == "$reference_allele" ]]; then
+            genome_folder="$reference_genome_dir"
+        else
+            genome_folder="$alternate_genome_dir"
+        fi
+
+        log "Running methylation extractor for $sample, allele $allele"
+        log "BAM: $bam"
+        log "Genome: $genome_folder"
+
+        methylation_log="$methylation_dir/${sample}_${allele}_methylation_extractor.log"
+
+        log "Methylation extractor log: $methylation_log"
+
+        bismark_methylation_extractor \
+            -o "$methylation_dir" \
+            --genome_folder "$genome_folder" \
+            --bedGraph \
+            --cytosine_report \
+            "$bam" \
+            > "$methylation_log" 2>&1
+
+        coverage_file="$methylation_dir/$(basename "$bam" .bam).bismark.cov.gz"
+
+        check_file_exists "$coverage_file"
+
+        cp "$coverage_file" "$results_dir/"
+
+        log "Copied final coverage file to $results_dir"
+
+    done
+
+done
+
+log "Finished Bismark methylation extraction"

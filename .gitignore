@@ -1,0 +1,18 @@
+# Reference genome and index
+*.fa
+*.fasta
+*.fa.fai
+*.fasta.fai
+
+# Pipeline working files
+work/
+
+# Final analysis results
+results/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
