@@ -6,6 +6,13 @@ PIPELINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 source "$PIPELINE_DIR/scripts/pipeline_utils.sh"
 
+if [[ "${CONDA_DEFAULT_ENV:-}" != "bisulfite-allele-pipeline" ]]; then
+    log_error "The bisulfite-allele-pipeline Conda environment is not active.
+Please run:
+    conda activate bisulfite-allele-pipeline
+and then rerun the pipeline."
+fi
+
 if [[ $# -ne 1 ]]; then
     echo "Usage: $0 <config_file>"
     echo "Example: $0 config/config.sh"

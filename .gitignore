@@ -16,3 +16,6 @@ results/
 # Python
 __pycache__/
 *.py[cod]
+
+# Personal configuration
+config/my_config.sh
